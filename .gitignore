@@ -40,3 +40,9 @@ data/
 # Archives
 *.zip
 *.tar
+
+# frontend build & deps
+/frontend/build/
+/frontend/node_modules/
+/frontend/.env
+/front-end/.env.local
