@@ -1,0 +1,42 @@
+# Python virtualenvs
+.venv/
+venv/
+env/
+ENV/
+.Python
+
+# Environment / secrets
+.env
+.env.*
+.env.bak
+secrets.json
+
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+
+# IDEs / editors
+.vscode/
+.idea/
+
+# Distribution / build
+dist/
+build/
+*.egg-info/
+
+# OS / misc
+.DS_Store
+Thumbs.db
+*.log
+
+# Database / data
+*.sqlite3
+*.db
+data/
+
+# Archives
+*.zip
+*.tar
