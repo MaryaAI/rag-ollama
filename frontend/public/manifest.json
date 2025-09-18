@@ -1,0 +1,8 @@
+{
+  "short_name": "RAG",
+  "name": "RAG Frontend",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#000000"
+}
