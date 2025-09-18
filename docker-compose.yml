@@ -1,0 +1,66 @@
+version: "3.8"
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: ragdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  ollama:
+    image: ghcr.io/ollama/ollama:latest
+    environment:
+      - OLLAMA_ALLOW_LOCAL=true
+    volumes:
+      - ollama_models:/root/.ollama
+    ports:
+      - "11434:11434"
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_BASE=http://ollama:11434
+      - PGHOST=postgres
+      - PGDATABASE=ragdb
+      - PGUSER=postgres
+      - PGPASSWORD=postgres
+      - PGPORT=5432
+      - EMBED_MODEL=all-minilm
+      - GEN_MODEL=smollm:135m
+      - BACKEND_INTERNAL_URL=http://backend:8081
+    depends_on:
+      - postgres
+      - ollama
+    expose:
+      - "8081"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    depends_on:
+      - backend
+    expose:
+      - "80"
+
+  nginx:
+    image: nginx:stable-alpine
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./frontend/build:/usr/share/nginx/html:ro
+    ports:
+      - "80:80"
+    depends_on:
+      - frontend
+      - backend
+
+volumes:
+  pgdata:
+  ollama_models:
