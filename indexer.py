@@ -6,7 +6,6 @@ from tqdm import tqdm
 
 # Docling (import from submodule)
 from docling.document_converter import DocumentConverter
-
 from llama_index.core import Document, StorageContext, VectorStoreIndex
 from llama_index.core.node_parser import SentenceWindowNodeParser
 from llama_index.vector_stores.postgres import PGVectorStore
