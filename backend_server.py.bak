@@ -1,89 +1,271 @@
-# backend_server.py - minimal FastAPI service (retrieval + Ollama shim)
-import os, json
-from typing import Optional, List, Dict, Any
+# backend_server.py - FastAPI RAG backend with Ollama reranker + synth
+import os
+import json
+import re
+import time
+from typing import Optional, List, Dict, Any, Union
+
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import requests
-from llama_index.llms.ollama import Ollama
-import re
-import time
+from llama_index.embeddings.ollama import OllamaEmbedding
+from llama_index.core import VectorStoreIndex, StorageContext
+from llama_index.vector_stores.postgres import PGVectorStore
+
+
 from llama_index.vector_stores.postgres import PGVectorStore
 from llama_index.core import VectorStoreIndex, StorageContext
 from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.llms.ollama import Ollama
+# from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+
+# add these near the top of backend_server.py
+from sentence_transformers import SentenceTransformer
+# --- SentenceTransformers embedding adapter that subclasses LlamaIndex BaseEmbedding ---
+# Robustly locate llama_index BaseEmbedding and provide a SentenceTransformers adapter
+import importlib
+import sys
+from typing import List
+
+# Attempt to find the real BaseEmbedding used by the installed llama_index version
+_BASE_EMBEDDING = None
+_candidate_modules = [
+    "llama_index.embeddings.base",
+    "llama_index.core.embeddings.base",
+    "llama_index.core.base",
+    "llama_index.core.embeddings",
+    "llama_index.embeddings",
+]
+
+for mod_name in _candidate_modules:
+    try:
+        mod = importlib.import_module(mod_name)
+        if hasattr(mod, "BaseEmbedding"):
+            _BASE_EMBEDDING = getattr(mod, "BaseEmbedding")
+            # found the real one — stop searching
+            break
+    except Exception:
+        # ignore import errors and try next candidate
+        continue
+
+# If not found, define a lightweight shim and warn (this avoids import failures,
+# but the library's isinstance check might not match the shim — see notes).
+if _BASE_EMBEDDING is None:
+    class BaseEmbedding:  # fallback shim
+        """Fallback shim BaseEmbedding used only if llama_index's BaseEmbedding can't be imported."""
+        pass
+
+    _BASE_EMBEDDING = BaseEmbedding
+    # Print a diagnostic to stderr so it's visible in logs
+    print("WARNING: could not locate llama_index.BaseEmbedding in known locations. "
+          "Using fallback shim. If you see assertions about BaseEmbedding, please "
+          "run the discovery snippet and update llama_index or tell me the output.",
+          file=sys.stderr)
+
+# Now define a robust adapter that subclasses the discovered BaseEmbedding.
+# This adapter uses sentence-transformers to compute embeddings lazily.
+try:
+    from sentence_transformers import SentenceTransformer
+except Exception:
+    SentenceTransformer = None  # we'll raise a clear error later if used
+
+class SentenceTransformersEmbedding(_BASE_EMBEDDING):
+    """
+    Adapter that subclasses the discovered llama_index BaseEmbedding (if available).
+    Implements common method names used by llama_index: get_query_embedding,
+    get_agg_embedding_from_queries, embed_query, embed_documents, embed_documents.
+    """
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+        # call parent constructor if applicable
+        try:
+            super().__init__()
+        except Exception:
+            pass
+        self.model_name = model_name
+        if SentenceTransformer is None:
+            raise RuntimeError("sentence-transformers is not installed. Run: pip install sentence-transformers")
+        # lazy init: don't load model until first request (faster startup)
+        self._model = None
+
+    def _ensure_model(self):
+        if self._model is None:
+            self._model = SentenceTransformer(self.model_name)
+
+    # llama_index historically uses methods like get_query_embedding / get_agg_embedding_from_queries.
+    def get_query_embedding(self, text: str) -> List[float]:
+        self._ensure_model()
+        arr = self._model.encode(str(text))
+        try:
+            return arr.tolist()
+        except Exception:
+            return list(arr)
+
+    def get_agg_embedding_from_queries(self, queries):
+        # queries may be list[str] or list[QueryBundle] depending on LL Index version.
+        out = []
+        for q in queries:
+            q_text = q if isinstance(q, str) else getattr(q, "text", str(q))
+            out.append(self.get_query_embedding(q_text))
+        return out
+
+    # Some llama_index versions call embed_query / embed_documents — provide aliases.
+    def embed_query(self, text: str):
+        return self.get_query_embedding(text)
+
+    def embed_documents(self, docs):
+        """
+        docs: list of strings or objects with 'text' attribute. Return list of embeddings.
+        """
+        out = []
+        for d in docs:
+            if isinstance(d, str):
+                t = d
+            else:
+                # attempt to extract text attribute, fallback to str()
+                t = getattr(d, "text", None) or getattr(d, "get_text", lambda: str(d))()
+            out.append(self.get_query_embedding(t))
+        return out
+
+
+    # Optional convenience: alias expected method names used by some LlamaIndex versions
+    # if your llama_index calls 'get_query_embedding' directly that is covered; if it calls
+    # other names later, we can add them as needed.
+
 
 load_dotenv()
-def env(k,d=None): v=os.getenv(k,d); 
-def_env_missing=False
-if env("__DUMMY__",None): pass
-# Simple env helper
-def env_func(k,d=None):
-    v=os.getenv(k,d)
-    if v is None:
-        raise RuntimeError(f"Missing env var: {k}")
-    return v
-OLLAMA_BASE = os.getenv("OLLAMA_BASE_URL","http://localhost:11434")
-EMBED_MODEL = os.getenv("EMBED_MODEL","all-minilm")
-EMBED_DIM = int(os.getenv("EMBED_DIM","384"))
 
-
-def ollama_generate(payload: dict) -> dict:
-    """
-    Call Ollama /api/generate and return parsed JSON response.
-    Raises HTTPException (502) on failure so FastAPI returns an error.
-    """
-    try:
-        resp = requests.post(f"{OLLAMA_BASE}/api/generate", json=payload, timeout=120)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        # wrap to HTTPException so it surfaces in API response
-        raise HTTPException(status_code=502, detail=f"Ollama generate error: {e}")
-
-
+# Config (read from .env)
+OLLAMA_BASE = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "all-minilm")
+EMBED_DIM = int(os.getenv("EMBED_DIM", "384"))
 
 PG_PARAMS = dict(
-    database=os.getenv("PGDATABASE","ragdb"),
-    host=os.getenv("PGHOST","localhost"),
-    password=os.getenv("PGPASSWORD","postgres"),
-    port=int(os.getenv("PGPORT","5432")),
-    user=os.getenv("PGUSER","postgres"),
-    table_name=os.getenv("PG_TABLE","rag_chunks"),
+    database=os.getenv("PGDATABASE", "ragdb"),
+    host=os.getenv("PGHOST", "localhost"),
+    password=os.getenv("PGPASSWORD", "postgres"),
+    port=int(os.getenv("PGPORT", "5432") or 5432),
+    user=os.getenv("PGUSER", "postgres"),
+    table_name=os.getenv("PG_TABLE", "rag_chunks"),
     embed_dim=EMBED_DIM,
 )
 
 app = FastAPI(title="RAG backend")
 
-INDEX=None
+# Robust Ollama HTTP helpers (replace existing functions)
+def _safe_parse_json_from_text(text: str):
+    """Try to extract a single JSON object from a blob of text; returns dict or None."""
+    try:
+        return json.loads(text)
+    except Exception:
+        # try to find first {...} block and parse that
+        m = re.search(r'(\{[\s\S]*\})', text)
+        if m:
+            try:
+                return json.loads(m.group(1))
+            except Exception:
+                return None
+        return None
+
+def ollama_generate(payload: dict) -> Union[dict, str]:
+    """
+    Call Ollama /api/generate and return either a parsed dict or a dict with {'raw': text}.
+    Do NOT raise a parsing error for "Extra data".
+    """
+    try:
+        resp = requests.post(f"{OLLAMA_BASE}/api/generate", json=payload, timeout=120)
+        resp.raise_for_status()
+        # try normal json
+        try:
+            return resp.json()
+        except ValueError:
+            # try to salvage JSON inside the text
+            txt = resp.text
+            parsed = _safe_parse_json_from_text(txt)
+            if parsed is not None:
+                return parsed
+            # fallback: return raw text inside a dict so callers can use it
+            return {"raw": txt}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Ollama generate error: {e}")
+
+def ollama_chat(payload: dict) -> Union[dict, str]:
+    """
+    Call Ollama /api/chat and return parsed dict or {'raw': text}.
+    """
+    try:
+        resp = requests.post(f"{OLLAMA_BASE}/api/chat", json=payload, timeout=120)
+        resp.raise_for_status()
+        try:
+            return resp.json()
+        except ValueError:
+            txt = resp.text
+            parsed = _safe_parse_json_from_text(txt)
+            if parsed is not None:
+                return parsed
+            return {"raw": txt}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Ollama chat error: {e}")
+
+# --- Lazy index cache ---
+INDEX = None
+# def get_index():
+#     global INDEX
+#     if INDEX is not None:
+#         return INDEX
+#     vs = PGVectorStore.from_params(**PG_PARAMS)
+#     storage = StorageContext.from_defaults(vector_store=vs)
+#     INDEX = VectorStoreIndex.from_vector_store(
+#         vs,
+#         storage_context=storage,
+#         # embed_model=OllamaEmbedding(model_name=EMBED_MODEL, base_url=OLLAMA_BASE),
+#         embed_model = HuggingFaceEmbedding(model_name="all-MiniLM-L6-v2"),
+#     )
+#     return INDEX
+# --- Lazy index cache ---
+INDEX = None
 def get_index():
+    """
+    Build / cache the VectorStoreIndex using a stable embedding implementation.
+    We prefer OllamaEmbedding here to avoid version mismatches in llama-index
+    embedding classes.
+    """
     global INDEX
     if INDEX is not None:
         return INDEX
+
+    # Build the PG-backed vector store
     vs = PGVectorStore.from_params(**PG_PARAMS)
     storage = StorageContext.from_defaults(vector_store=vs)
-    INDEX = VectorStoreIndex.from_vector_store(vs, storage_context=storage, embed_model=OllamaEmbedding(model_name=EMBED_MODEL, base_url=OLLAMA_BASE))
+
+    # Choose embedding model:
+    # Prefer Ollama-based embeddings (works with your Ollama server at OLLAMA_BASE).
+    # EMBED_MODEL is read from .env (default "all-minilm").
+    embed_model = OllamaEmbedding(model_name=EMBED_MODEL, base_url=OLLAMA_BASE)
+
+    # Create the index from the vector store, providing the embedding
+    INDEX = VectorStoreIndex.from_vector_store(
+        vs,
+        storage_context=storage,
+        embed_model=embed_model,
+    )
     return INDEX
+
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "ollama": OLLAMA_BASE}
+    return {"ok": True, "ollama": OLLAMA_BASE, "pg_table": PG_PARAMS.get("table_name")}
 
+# Accept either a string or an object for query (robust)
 class RagQuery(BaseModel):
-    query: str
+    query: Union[str, Dict[str, Any]]
     top_k: Optional[int] = 5
 
-# @app.post("/rag/query")
-# def rag_query(body: RagQuery):
-#     idx = get_index()
-#     try:
-#         qe = idx.as_query_engine(similarity_top_k=body.top_k or 5)
-#         answer = qe.query(body.query)
-#         return {"answer": str(answer), "raw": answer}
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
-
-
+# --- Reranker helpers (uses Ollama chat API for scoring) ---
 def _parse_score_from_text(text: str):
     """
     Try to extract a numeric score from Ollama output.
@@ -91,20 +273,16 @@ def _parse_score_from_text(text: str):
     """
     if not text:
         return None
-    # try JSON
     try:
-        import json
         j = json.loads(text)
         if isinstance(j, dict) and "score" in j:
             return float(j["score"])
     except Exception:
         pass
-    # fallback: find first float-looking substring
     m = re.search(r"([0-9]*\.?[0-9]+)", text)
     if m:
         try:
             v = float(m.group(1))
-            # clamp
             return max(0.0, min(1.0, v))
         except Exception:
             return None
@@ -114,14 +292,13 @@ def _score_candidates_with_ollama(candidates, query, model=None, base_url=None, 
     """
     candidates: list of dicts { 'text_preview': str, 'source': ..., 'filename': ..., 'chunk_id': ... }
     returns: list of tuples (candidate, score) with score in 0..1
-    Implementation: call Ollama /api/chat per candidate with a small scoring prompt (could be batched)
     """
     scores = []
     model = model or os.getenv("GEN_MODEL", "smollm:135m")
-    base_url = base_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    base_url = base_url or OLLAMA_BASE
 
     for c in candidates:
-        # build minimal prompt instructing model to output JSON {"score":0.0}
+        # small instruction to return JSON {"score":0.87}
         prompt = (
             "You are a relevance scorer. Given the user query and a document excerpt, "
             "return a JSON object with a single numeric field 'score' with a value between 0 and 1 "
@@ -134,52 +311,46 @@ def _score_candidates_with_ollama(candidates, query, model=None, base_url=None, 
 
         payload = {"model": model, "messages": [{"role":"user", "content": prompt}], "stream": False}
         try:
-            resp = requests.post(f"{base_url}/api/chat", json=payload, timeout=timeout)
-            resp.raise_for_status()
-            body = resp.json()
-            # body shape may vary: try to extract assistant content
-            content = None
+            # Use robust helper instead of direct requests.post(...).json()
+            body = ollama_chat(payload)
+            # 'body' may be a dict or {'raw': text}; convert to a string 'content' favoring known keys
             if isinstance(body, dict):
-                # try a few shapes
-                if "content" in body:
-                    content = body.get("content")
-                elif "responses" in body and isinstance(body["responses"], list) and body["responses"]:
-                    first = body["responses"][0]
-                    if isinstance(first, dict):
-                        content = first.get("content") or first.get("message") or str(first)
-                    else:
-                        content = str(first)
-                else:
-                    content = str(body)
+                content = body.get("content") or body.get("text") or body.get("raw") or str(body)
             else:
                 content = str(body)
+
             score = _parse_score_from_text(content)
             if score is None:
-                # fallback: very small default to avoid crash
                 score = 0.0
-        except Exception as e:
-            # on failure, set score 0 and continue
+        except Exception:
             score = 0.0
         scores.append((c, float(score)))
     return scores
 
+# --- Main RAG endpoint (retrieval + rerank + synth)
 @app.post("/rag/query")
 def rag_query(body: RagQuery):
     """
     RAG with re-ranking + synthesizing on top contexts.
     Returns final synthesized answer plus reordered sources with scores.
     """
+    # normalize query text (support either "query": "text" or "query": {"text": "..."} )
+    if isinstance(body.query, str):
+        q_text = body.query
+    elif isinstance(body.query, dict):
+        q_text = body.query.get("text") or body.query.get("query") or ""
+    else:
+        q_text = str(body.query)
+
     index = get_index()
     try:
-        # create Ollama LLM for generation
-        llm = Ollama(model=os.getenv("GEN_MODEL", "smollm:135m"),
-                     base_url=os.getenv("OLLAMA_BASE_URL"),
-                     request_timeout=120.0)
+        # create Ollama LLM for generation/reranking
+        llm = Ollama(model=os.getenv("GEN_MODEL", "smollm:135m"), base_url=OLLAMA_BASE, request_timeout=120.0)
 
         # Step A: retrieve a broader set of candidates
         retrieval_k = max(5, (body.top_k or 5) * 3)
         qe = index.as_query_engine(similarity_top_k=retrieval_k, llm=llm)
-        response = qe.query(body.query)
+        response = qe.query(q_text)
 
         # Best-effort extract candidate source_nodes
         candidates = []
@@ -204,11 +375,9 @@ def rag_query(body: RagQuery):
                         "orig_score": float(score) if score is not None else None
                     })
             elif hasattr(response, "get_formatted_sources"):
-                # fallback: when we only get formatted sources
                 fmt = response.get_formatted_sources()
                 candidates = [{"chunk_id": None, "source": None, "filename": None, "text_preview": fmt, "orig_score": None}]
             elif isinstance(response, dict) and "sources" in response:
-                # if the response is dict-like
                 for s in response.get("sources", []):
                     candidates.append({"chunk_id": s.get("chunk_id"), "source": s.get("source"), "filename": s.get("filename"), "text_preview": s.get("text")[:2000], "orig_score": s.get("score")})
         except Exception:
@@ -219,10 +388,7 @@ def rag_query(body: RagQuery):
             return {"answer": str(response), "sources": [], "raw": str(response)}
 
         # Step B: rerank candidates using Ollama-based cross-encoder (scores 0..1)
-        scored = _score_candidates_with_ollama(candidates, body.query,
-                                               model=os.getenv("GEN_MODEL", "smollm:135m"),
-                                               base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"))
-        # sort descending by score
+        scored = _score_candidates_with_ollama(candidates, q_text, model=os.getenv("GEN_MODEL", "smollm:135m"), base_url=OLLAMA_BASE)
         scored_sorted = sorted(scored, key=lambda t: t[1], reverse=True)
 
         # choose final top_k
@@ -238,23 +404,41 @@ def rag_query(body: RagQuery):
             "You are a helpful assistant that must answer the user's query using ONLY the provided contexts. "
             "If the answer is not in the contexts, say 'I don't know' (do not hallucinate). "
             "Cite the source path after each sentence or bullet where relevant.\n\n"
-            f"User query: {body.query}\n\n"
+            f"User query: {q_text}\n\n"
             "Contexts:\n\n" + contexts_text +
             "\n\nTask: Provide a concise answer (3-6 lines) grounded in the contexts and list sources used.\n"
         )
 
-        # use Ollama generate API to synthesize final answer
         synth_payload = {"model": os.getenv("GEN_MODEL", "smollm:135m"), "prompt": synth_prompt}
         synth_resp = ollama_generate(synth_payload)
-        # synth_resp may be structured variously; try to extract content
+
+        # robustly extract the generated text from synth_resp
         synth_text = None
         if isinstance(synth_resp, dict):
-            # try common keys
-            synth_text = synth_resp.get("content") or synth_resp.get("output") or (synth_resp.get("responses", [{}])[0].get("content") if synth_resp.get("responses") else None)
+            # try common keys returned by different Ollama versions
+            for k in ("content", "output", "text", "response", "generated"):
+                if k in synth_resp and synth_resp.get(k):
+                    synth_text = synth_resp.get(k)
+                    break
+            # sometimes Ollama returns {"responses": [{"content": "..."}]}
             if synth_text is None:
+                if "responses" in synth_resp and isinstance(synth_resp["responses"], list) and synth_resp["responses"]:
+                    first = synth_resp["responses"][0]
+                    if isinstance(first, dict) and "content" in first:
+                        synth_text = first.get("content")
+                    else:
+                        synth_text = str(first)
+            # fallback to 'raw' if present
+            if synth_text is None and "raw" in synth_resp:
+                synth_text = synth_resp.get("raw")
+            if synth_text is None:
+                # final fallback: stringified dict
                 synth_text = str(synth_resp)
         else:
+            # if it's already a string, use it
             synth_text = str(synth_resp)
+
+
 
         # prepare sources array for return (include model's rerank score)
         out_sources = []
@@ -269,4 +453,8 @@ def rag_query(body: RagQuery):
 
         return {"answer": synth_text, "sources": out_sources, "raw_retrieval": str(response)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Retrieval/Rerank error: {e}")
+        import traceback
+        tb = traceback.format_exc()
+        print('RAG HANDLER EXCEPTION:\n', tb)
+        # Return the full traceback in the HTTP response (debug only)
+        raise HTTPException(status_code=500, detail=f"Retrieval/Rerank error: {str(e)}\n\nTraceback:\n{tb}")

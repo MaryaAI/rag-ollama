@@ -35,7 +35,7 @@ index = VectorStoreIndex.from_vector_store(vs, storage_context=storage, embed_mo
 
 # Use Ollama LLM for generation in the query engine
 llm = Ollama(model=GEN_MODEL, base_url=OLLAMA_BASE, request_timeout=120.0)
-qe = index.as_query_engine(similarity_top_k=5, llm=llm)
-resp = qe.query("Give me a short overview of the uploaded documents.")
+qe = index.as_query_engine(similarity_top_k=1, llm=llm)
+resp = qe.query("What does Rahaf build?")
 print(resp)
 
